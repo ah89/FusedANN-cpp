@@ -1,0 +1,39 @@
+# Build artefacts
+build/
+
+# Third-party checkouts
+third_party/
+
+# Downloaded datasets and derived files
+data/
+
+# Python virtual environments
+.venv/
+
+
+cache/
+
+# macOS cruft
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Python caches
+__pycache__/
+
+# Local run logs / scratch
+logs/
+*.tmp
+*.output
+
+*.tex
+*.log
+*.pyc
+*.json
+*.jsonl
+*.bin
+*.meta
+

@@ -1,0 +1,305 @@
+diff --git a/benchmark/datasets.py b/benchmark/datasets.py
+index 0b4fbd2..ef3b719 100644
+--- a/benchmark/datasets.py
++++ b/benchmark/datasets.py
+@@ -862,6 +862,51 @@ class YFCC100MDataset(DatasetCompetitionFormat):
+             return "knn"
+ 
+ 
++class Sift1MFilterDataset(DatasetCompetitionFormat):
++    """Filtered k-NN variant backed by the classic SIFT1M descriptors."""
++
++    def __init__(self):
++        self.nb = 10 ** 6
++        self.d = 128
++        self.nq = 10000
++        self.dtype = "float32"
++        self.ds_fn = "sift1m.base.fbin"
++        self.qs_fn = "sift1m.query.public.10K.fbin"
++        self.gt_fn = "sift1m.GT.public.ibin"
++        self.ds_metadata_fn = "sift1m.base.metadata.spmat"
++        self.qs_metadata_fn = "sift1m.query.metadata.public.spmat"
++        self.base_url = None
++        self.basedir = os.path.join(BASEDIR, "sift1m-filter")
++
++    def prepare(self, skip_data=False):
++        del skip_data  # interface parity; nothing to download
++        os.makedirs(self.basedir, exist_ok=True)
++        required = (
++            self.ds_fn,
++            self.qs_fn,
++            self.gt_fn,
++            self.ds_metadata_fn,
++            self.qs_metadata_fn,
++        )
++        missing = [name for name in required if not os.path.exists(os.path.join(self.basedir, name))]
++        if missing:
++            raise RuntimeError(
++                "Sift1M filter dataset missing files: " + ", ".join(missing)
++            )
++
++    def get_dataset_metadata(self):
++        return read_sparse_matrix(os.path.join(self.basedir, self.ds_metadata_fn))
++
++    def get_queries_metadata(self):
++        return read_sparse_matrix(os.path.join(self.basedir, self.qs_metadata_fn))
++
++    def distance(self):
++        return "euclidean"
++
++    def search_type(self):
++        return "knn_filtered"
++
++
+ def _strip_gz(filename):
+     if not filename.endswith('.gz'):
+         raise RuntimeError(f"expected a filename ending with '.gz'. Received: {filename}")
+@@ -1298,6 +1343,7 @@ DATASETS = {
+     'yfcc-10M-unfiltered': lambda: YFCC100MDataset(filtered=False),
+     'yfcc-10M-dummy': lambda: YFCC100MDataset(dummy=True),
+     'yfcc-10M-dummy-unfiltered': lambda: YFCC100MDataset(filtered=False, dummy=True),
++    'sift1m-filter': lambda: Sift1MFilterDataset(),
+ 
+     'sparse-small': lambda: SparseDataset("small"),
+     'sparse-1M': lambda: SparseDataset("1M"),
+diff --git a/neurips23/filter/faiss/config.yaml b/neurips23/filter/faiss/config.yaml
+index 62cc5b2..7edbca3 100644
+--- a/neurips23/filter/faiss/config.yaml
++++ b/neurips23/filter/faiss/config.yaml
+@@ -26,6 +26,21 @@ random-s:
+             [{"nprobe": 1},
+               {"nprobe":2},
+               {"nprobe":4}]
++sift1m-filter:
++    faiss:
++      docker-tag: neurips23-filter-faiss
++      module: neurips23.filter.faiss.faiss
++      constructor: FAISS
++      base-args: ["@metric"]
++      run-groups:
++        base:
++          args: |
++            [{"indexkey": "IVF1024,SQ8"}]
++          query-args: |
++            [{"nprobe": 1},
++             {"nprobe": 2},
++             {"nprobe": 4},
++             {"nprobe": 8}]
+ yfcc-10M-unfiltered:
+     faiss:
+       docker-tag: neurips23-filter-faiss
+diff --git a/neurips23/filter/faiss/faiss.py b/neurips23/filter/faiss/faiss.py
+index 02980d1..e1f1812 100644
+--- a/neurips23/filter/faiss/faiss.py
++++ b/neurips23/filter/faiss/faiss.py
+@@ -11,20 +11,24 @@ from neurips23.filter.base import BaseFilterANN
+ from benchmark.datasets import DATASETS
+ from benchmark.dataset_io import download_accelerated
+ 
+-import bow_id_selector
++try:
++    import bow_id_selector
++except ImportError:  # pragma: no cover - optional extension
++    bow_id_selector = None
+ 
+ def csr_get_row_indices(m, i):
+     """ get the non-0 column indices for row i in matrix m """
+     return m.indices[m.indptr[i] : m.indptr[i + 1]]
+ 
+ def make_bow_id_selector(mat, id_mask=0):
++    if bow_id_selector is None:
++        raise RuntimeError("bow_id_selector extension not available")
+     sp = faiss.swig_ptr
+     if id_mask == 0:
+         return bow_id_selector.IDSelectorBOW(mat.shape[0], sp(mat.indptr), sp(mat.indices))
+-    else:
+-        return bow_id_selector.IDSelectorBOWBin(
+-            mat.shape[0], sp(mat.indptr), sp(mat.indices), id_mask
+-        )
++    return bow_id_selector.IDSelectorBOWBin(
++        mat.shape[0], sp(mat.indptr), sp(mat.indices), id_mask
++    )
+ 
+ def set_invlist_ids(invlists, l, ids):
+     n, = ids.shape
+@@ -50,6 +54,12 @@ def csr_to_bitcodes(matrix, bitsig):
+         bit_codes[i] = np.bitwise_or.reduce(bitsig[indices[indptr[i]:indptr[i + 1]]])
+     return bit_codes
+ 
++def intersect_docs(lhs, rhs):
++    if bow_id_selector is not None:
++        return bow_id_selector.intersect_sorted(lhs, rhs)
++    # fallback: numpy intersection assumes sorted inputs from CSR indices
++    return np.intersect1d(lhs, rhs, assume_unique=False).astype(lhs.dtype, copy=False)
++
+ 
+ class BinarySignatures:
+     """ binary signatures that encode vectors """
+@@ -87,7 +97,9 @@ class FAISS(BaseFilterANN):
+         self._metric = metric
+         print(index_params)
+         self.indexkey = index_params.get("indexkey", "IVF32768,SQ8")
+-        self.binarysig = index_params.get("binarysig", True)
++        self.force_metadata_only = bow_id_selector is None
++        requested_binarysig = index_params.get("binarysig", True)
++        self.binarysig = False if self.force_metadata_only else requested_binarysig
+         self.binarysig_proba1 = index_params.get("binarysig_proba1", 0.1)
+         self.metadata_threshold = 1e-3
+         self.nt = index_params.get("threads", 1)
+@@ -221,11 +233,12 @@ class FAISS(BaseFilterANN):
+                 freq *= freq_per_word[w2]
+             else:
+                 w2 = -1
+-            if freq < self.metadata_threshold:
++            use_metadata_path = self.force_metadata_only or freq < self.metadata_threshold
++            if use_metadata_path:
+                 # metadata first
+                 docs = csr_get_row_indices(docs_per_word, w1)
+                 if w2 != -1:
+-                    docs = bow_id_selector.intersect_sorted(
++                    docs = intersect_docs(
+                         docs, csr_get_row_indices(docs_per_word, w2))
+ 
+                 assert len(docs) >= k, pdb.set_trace()
+@@ -234,6 +247,8 @@ class FAISS(BaseFilterANN):
+  
+                 self.I[q, :] = docs[Ii.ravel()]
+             else:
++                if bow_id_selector is None:
++                    raise RuntimeError("bow_id_selector module required for IVF filtering")
+                 # IVF first, filtered search
+                 sel = make_bow_id_selector(meta_b, self.binsig.id_mask if self.binsig else 0)
+                 if self.binsig is None:
+diff --git a/neurips23/filter/faissplus/config.yaml b/neurips23/filter/faissplus/config.yaml
+index bb8ce6f..54a579a 100644
+--- a/neurips23/filter/faissplus/config.yaml
++++ b/neurips23/filter/faissplus/config.yaml
+@@ -26,6 +26,21 @@ random-s:
+             [{"nprobe": 1},
+               {"nprobe":2},
+               {"nprobe":4}]
++sift1m-filter:
++    faissplus:
++      docker-tag: neurips23-filter-faissplus
++      module: neurips23.filter.faissplus.faiss
++      constructor: FAISS
++      base-args: ["@metric"]
++      run-groups:
++        base:
++          args: |
++            [{"indexkey": "IVF1024,SQ8"}]
++          query-args: |
++            [{"nprobe": 1},
++             {"nprobe": 2},
++             {"nprobe": 4},
++             {"nprobe": 8}]
+ yfcc-10M-unfiltered:
+     faissplus:
+       docker-tag: neurips23-filter-faissplus
+diff --git a/neurips23/filter/parlayivf/config.yaml b/neurips23/filter/parlayivf/config.yaml
+index 7fff319..8005baf 100644
+--- a/neurips23/filter/parlayivf/config.yaml
++++ b/neurips23/filter/parlayivf/config.yaml
+@@ -29,6 +29,38 @@ random-filter-s:
+               "beam_widths": [70, 70, 70]
+               }]
+ 
++sift1m-filter:
++    parlayivf:
++      docker-tag: neurips23-filter-parlayivf
++      module: neurips23.filter.parlayivf.parlayivf
++      constructor: ParlayIVF
++      base-args: ["@metric"]
++      run-groups:
++        base:
++          args: |
++            [{"cluster_size": 1000,
++              "T": 4,
++              "cutoff": 4000,
++              "max_iter": 10,
++              "weight_classes": [10000, 20000],
++              "build_params": [{"max_degree": 8,
++                                "limit": 150,
++                                "alpha": 1.2},
++                               {"max_degree": 12,
++                                "limit": 150,
++                                "alpha": 1.2}],
++              "bitvector_cutoff": 4000
++            }]
++          query-args: |
++            [{"target_points": 20000,
++              "sq_target_points": 20000,
++              "tiny_cutoff": 80000,
++              "beam_widths": [64, 64, 64],
++              "search_limits": [30000, 80000, 1000000]
++              },
++             {"target_points": 40000,
++              "sq_target_points": 40000,
++              "tiny_cutoff": 120000,
++              "beam_widths": [96, 96, 64],
++              "search_limits": [60000, 150000, 2000000]
++              },
++             {"target_points": 60000,
++              "sq_target_points": 60000,
++              "tiny_cutoff": 160000,
++              "beam_widths": [128, 128, 96],
++              "search_limits": [120000, 240000, 3000000]
++              }]
++
+ yfcc-10M:
+     parlayivf:
+       docker-tag: neurips23-filter-parlayivf
+diff --git a/neurips23/filter/puck/config.yaml b/neurips23/filter/puck/config.yaml
+index 7fff319..90b911f 100644
+--- a/neurips23/filter/puck/config.yaml
++++ b/neurips23/filter/puck/config.yaml
+@@ -29,6 +29,49 @@ random-filter-s:
+                     {"radius_rate":1.00 ,"search_coarse_count":30, "filter_topk":120 }                 
+                 ]
+ 
++sift1m-filter:
++    puck:
++      docker-tag: neurips23-filter-puck
++      module: neurips23.filter.puck.puck
++      constructor: Puck
++      base-args: ["@metric"]
++      run-groups:
++        base:
++          args: |
++                [{ "index_type": 1, "C":64, "F":64, "FN":8, "N":0}]
++          query-args: |
++                [
++                    {"radius_rate":1.00 ,"search_coarse_count":20, "filter_topk":40},
++                    {"radius_rate":1.00 ,"search_coarse_count":20, "filter_topk":60},
++                    {"radius_rate":1.00 ,"search_coarse_count":20, "filter_topk":80}
++                ]
++
+ yfcc-10M-unfiltered:
+     puck:
+       docker-tag: neurips23-filter-puck
+diff --git a/neurips23/filter/pyanns/config.yaml b/neurips23/filter/pyanns/config.yaml
+index 9065542..12b97ca 100644
+--- a/neurips23/filter/pyanns/config.yaml
++++ b/neurips23/filter/pyanns/config.yaml
+@@ -26,6 +26,21 @@ random-s:
+           [{"nprobe": 1},
+             {"nprobe":2},
+             {"nprobe":4}]
++sift1m-filter:
++  pyanns:
++    docker-tag: neurips23-filter-pyanns
++    module: neurips23.filter.pyanns.pyanns
++    constructor: Pyanns
++    base-args: ["@metric"]
++    run-groups:
++      base:
++        args: |
++          [{"indexkey": "IVF1024,SQ8"}]
++        query-args: |
++          [{"nprobe": 1},
++           {"nprobe": 2},
++           {"nprobe": 4},
++           {"nprobe": 8}]
+ yfcc-10M-unfiltered:
+   pyanns:
+     docker-tag: neurips23-filter-pyanns
